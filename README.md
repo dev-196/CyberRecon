@@ -58,6 +58,19 @@ This tool is designed for legitimate cybersecurity professionals, penetration te
 - **Phone Lookup** - Phone number intelligence gathering
 - **Temp Mail** - Disposable email generation
 
+### 🗄️ Stealerlo.gs Integration (NEW!)
+- **Breach Search** - Access 12B+ stealerlog records
+- **Hash Cracking** - MD5, SHA1, SHA256, NTLM plaintext lookup
+- **Phone Intelligence** - Reverse phone lookup with caller details
+- **IP Geolocation** - Advanced IP information and network data
+- **Machine Forensics** - System information and file retrieval
+- **Domain Employee Search** - Find company credentials by domain
+- **Social Media Analysis** - Cross-platform account discovery
+- **OSINT Proxy** - Access Snusbase, Shodan, OSINTDog APIs
+- **Async Jobs** - UUID generation, logs search, domain scanning
+
+See [Stealerlo.gs API Documentation](./docs/STEALERLOGS_API.md) for complete integration details.
+
 ### 🔐 Obfuscation
 - **Script Editor Pro** - Advanced code editor with obfuscation
 - **EXE Obfuscator** - Windows executable obfuscation
